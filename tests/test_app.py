@@ -44,7 +44,7 @@ class AppTestCase(unittest.TestCase):
         response = self.client.get("/getFlights")
 
         self.assertEqual(response.status_code, 500)
-        self.assertEqual(response.get_json(), {"error": "Databricks unavailable"})
+        self.assertEqual(response.get_json(), {"error": "Failed to retrieve flights"})
 
 
 if __name__ == "__main__":

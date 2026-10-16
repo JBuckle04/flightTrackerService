@@ -44,8 +44,9 @@ def _query_flights():
 def get_flights() -> tuple:
     try:
         flights = _query_flights()
-    except Exception as error:
-        return jsonify({"error": str(error)}), 500
+    except Exception:
+        app.logger.exception("Failed to query flights from Databricks")
+        return jsonify({"error": "Failed to retrieve flights"}), 500
 
     return jsonify({"flights": flights}), 200
 

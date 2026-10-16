@@ -12,15 +12,16 @@ def health() -> tuple:
 
 
 def _query_flights():
-    server_hostname = os.getenv("DATABRICKS_SERVER_HOSTNAME")
+    server_hostname = os.getenv("DATABRICKS_HOST")
     http_path = os.getenv("DATABRICKS_HTTP_PATH")
-    access_token = os.getenv("DATABRICKS_ACCESS_TOKEN")
+    client_id = os.getenv("DATABRICKS_CLIENT_ID")
+    client_secret = os.getenv("DATABRICKS_CLIENT_SECRET")
     table_name = os.getenv("DATABRICKS_FLIGHTS_TABLE", "flights")
 
-    if not server_hostname or not http_path or not access_token:
+    if not server_hostname or not http_path or not client_id or not client_secret:
         raise ValueError(
-            "Missing Databricks configuration. Set DATABRICKS_SERVER_HOSTNAME, "
-            "DATABRICKS_HTTP_PATH, and DATABRICKS_ACCESS_TOKEN."
+            "Missing Databricks configuration. Set DATABRICKS_HOST, "
+            "DATABRICKS_HTTP_PATH, DATABRICKS_CLIENT_ID, and DATABRICKS_CLIENT_SECRET."
         )
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*){0,2}", table_name):
         raise ValueError("Invalid DATABRICKS_FLIGHTS_TABLE value.")
@@ -30,7 +31,8 @@ def _query_flights():
     with sql.connect(
         server_hostname=server_hostname,
         http_path=http_path,
-        access_token=access_token,
+        client_id=client_id,
+        client_secret=client_secret,
     ) as connection:
         with connection.cursor() as cursor:
             cursor.execute(f"SELECT * FROM {table_name}")

@@ -58,8 +58,17 @@ jobs:
           name: python-app
       
       - name: 'Deploy to Azure Web App'
-        uses: azure/webapps-deploy@v3
         id: deploy-to-webapp
+        continue-on-error: true
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: 'flighttracker'
+          slot-name: 'Production'
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_4A8E472784AB404C84149A019009377D }}
+
+      - name: 'Retry deploy to Azure Web App'
+        if: steps.deploy-to-webapp.outcome == 'failure'
+        uses: azure/webapps-deploy@v3
         with:
           app-name: 'flighttracker'
           slot-name: 'Production'

@@ -108,28 +108,78 @@ def _load_config():
 # ---------------------------------------------------------
 
 def _create_connection(config):
+    import base64
+    import json
+    import urllib.parse
+    import urllib.request
+
     start = time.monotonic()
 
     server_hostname = config["server_hostname"]
+    client_id = config["client_id"]
+    client_secret = config["client_secret"]
 
     app.logger.info(
-        "[DBX] Opening connection to host=%s",
+        "[DBX] Opening SQL-scoped connection to host=%s",
         server_hostname,
     )
 
-    def credential_provider():
-        sdk_config = Config(
-            host=f"https://{server_hostname}",
-            client_id=config["client_id"],
-            client_secret=config["client_secret"],
+    # -----------------------------------------------
+    # REQUEST LEAST-PRIVILEGE OAUTH TOKEN
+    # -----------------------------------------------
+
+    token_url = (
+        f"https://{server_hostname}/oidc/v1/token"
+    )
+
+    credentials = (
+        f"{client_id}:{client_secret}"
+    ).encode("utf-8")
+
+    basic_auth = base64.b64encode(
+        credentials
+    ).decode("ascii")
+
+    body = urllib.parse.urlencode({
+        "grant_type": "client_credentials",
+        "scope": "sql",
+    }).encode("utf-8")
+
+    request = urllib.request.Request(
+        token_url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Basic {basic_auth}",
+            "Content-Type":
+                "application/x-www-form-urlencoded",
+        },
+    )
+
+    with urllib.request.urlopen(
+        request,
+        timeout=15,
+    ) as response:
+        token_response = json.loads(
+            response.read().decode("utf-8")
         )
 
-        return oauth_service_principal(sdk_config)
+    access_token = token_response[
+        "access_token"
+    ]
+
+    app.logger.info(
+        "[DBX] SQL-scoped OAuth token obtained"
+    )
+
+    # -----------------------------------------------
+    # OPEN SQL CONNECTION
+    # -----------------------------------------------
 
     connection = sql.connect(
         server_hostname=server_hostname,
         http_path=config["http_path"],
-        credentials_provider=credential_provider,
+        access_token=access_token,
     )
 
     app.logger.info(

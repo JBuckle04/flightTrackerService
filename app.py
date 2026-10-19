@@ -7,7 +7,7 @@ from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-# Make sure diagnostic messages appear in Azure App Service Log Stream
+# Ensure logs appear in Azure App Service Log Stream
 logging.basicConfig(level=logging.INFO)
 app.logger.setLevel(logging.INFO)
 
@@ -23,13 +23,17 @@ def health():
 def _query_flights():
     start = time.monotonic()
 
+    # ---------------------------------------------------------
+    # LOAD CONFIG
+    # ---------------------------------------------------------
+
     server_hostname = os.getenv("DATABRICKS_HOST")
     http_path = os.getenv("DATABRICKS_HTTP_PATH")
     client_id = os.getenv("DATABRICKS_CLIENT_ID")
     client_secret = os.getenv("DATABRICKS_CLIENT_SECRET")
     table_name = os.getenv("DATABRICKS_FLIGHTS_TABLE", "flights")
 
-    # Check configuration exists without logging secrets
+    # Log whether variables exist, but NEVER log secrets
     config_status = {
         "DATABRICKS_HOST": bool(server_hostname),
         "DATABRICKS_HTTP_PATH": bool(http_path),
@@ -43,7 +47,12 @@ def _query_flights():
         config_status
     )
 
-    if not server_hostname or not http_path or not client_id or not client_secret:
+    if not all([
+        server_hostname,
+        http_path,
+        client_id,
+        client_secret
+    ]):
         raise ValueError(
             "Missing Databricks configuration. Set "
             "DATABRICKS_HOST, "
@@ -52,7 +61,7 @@ def _query_flights():
             "DATABRICKS_CLIENT_SECRET."
         )
 
-    # Protect table name because it gets inserted directly into SQL
+    # Prevent SQL injection through configurable table name
     if not re.fullmatch(
         r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*){0,2}",
         table_name
@@ -61,20 +70,45 @@ def _query_flights():
             "Invalid DATABRICKS_FLIGHTS_TABLE value."
         )
 
+    # ---------------------------------------------------------
+    # IMPORT DATABRICKS
+    # ---------------------------------------------------------
+
     app.logger.info(
-        "[DBX] Importing Databricks SQL connector"
+        "[DBX] Importing Databricks libraries"
     )
 
     from databricks import sql
+    from databricks.sdk.core import Config, oauth_service_principal
 
     app.logger.info(
-        "[DBX] Connector imported after %.2fs",
+        "[DBX] Databricks libraries imported after %.2fs",
         time.monotonic() - start
     )
 
     # ---------------------------------------------------------
-    # CONNECTION
+    # SERVICE PRINCIPAL AUTH
     # ---------------------------------------------------------
+
+    app.logger.info(
+        "[DBX] Configuring service principal OAuth"
+    )
+
+    def credential_provider():
+        config = Config(
+            host=f"https://{server_hostname}",
+            client_id=client_id,
+            client_secret=client_secret,
+        )
+
+        return oauth_service_principal(config)
+
+    # ---------------------------------------------------------
+    # CONNECT
+    # ---------------------------------------------------------
+
+    connection = None
+    cursor = None
 
     connect_start = time.monotonic()
 
@@ -87,8 +121,7 @@ def _query_flights():
         connection = sql.connect(
             server_hostname=server_hostname,
             http_path=http_path,
-            client_id=client_id,
-            client_secret=client_secret,
+            credentials_provider=credential_provider,
         )
 
     except Exception:
@@ -146,7 +179,7 @@ def _query_flights():
         )
 
         # -----------------------------------------------------
-        # FETCH
+        # FETCH RESULTS
         # -----------------------------------------------------
 
         fetch_start = time.monotonic()
@@ -181,27 +214,36 @@ def _query_flights():
         return flights
 
     finally:
-        # Always attempt to clean up explicitly
 
-        try:
-            cursor.close()
-            app.logger.info(
-                "[DBX] Cursor closed"
-            )
-        except Exception:
-            app.logger.exception(
-                "[DBX] Error closing cursor"
-            )
+        # -----------------------------------------------------
+        # CLEANUP
+        # -----------------------------------------------------
 
-        try:
-            connection.close()
-            app.logger.info(
-                "[DBX] Connection closed"
-            )
-        except Exception:
-            app.logger.exception(
-                "[DBX] Error closing connection"
-            )
+        if cursor is not None:
+            try:
+                cursor.close()
+
+                app.logger.info(
+                    "[DBX] Cursor closed"
+                )
+
+            except Exception:
+                app.logger.exception(
+                    "[DBX] Error closing cursor"
+                )
+
+        if connection is not None:
+            try:
+                connection.close()
+
+                app.logger.info(
+                    "[DBX] Connection closed"
+                )
+
+            except Exception:
+                app.logger.exception(
+                    "[DBX] Error closing connection"
+                )
 
         app.logger.info(
             "[DBX] Total DB operation: %.2fs",

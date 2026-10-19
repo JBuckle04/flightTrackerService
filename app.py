@@ -16,12 +16,29 @@ logging.basicConfig(level=logging.INFO)
 app.logger.setLevel(logging.INFO)
 
 
-# One reusable Databricks connection per application process.
+# ---------------------------------------------------------
+# SHARED PROCESS STATE
+# ---------------------------------------------------------
+
+# One reusable Databricks connection per Gunicorn worker.
 _db_connection = None
 
-# Prevent simultaneous requests from using the same connection.
+# Prevent concurrent use of the shared Databricks connection.
 _db_lock = threading.Lock()
 
+# In-memory flight cache.
+_flight_cache = {
+    "flights": None,
+    "timestamp": 0.0,
+}
+
+# Protect cache reads/writes.
+_cache_lock = threading.Lock()
+
+
+# ---------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------
 
 def _load_config():
     server_hostname = os.getenv("DATABRICKS_HOST")
@@ -33,6 +50,20 @@ def _load_config():
         "DATABRICKS_FLIGHTS_TABLE",
         "workspace.default.resolved_flights_v2",
     )
+
+    try:
+        cache_ttl = int(
+            os.getenv("FLIGHTS_CACHE_TTL", "30")
+        )
+    except ValueError:
+        raise ValueError(
+            "FLIGHTS_CACHE_TTL must be an integer."
+        )
+
+    if cache_ttl < 0:
+        raise ValueError(
+            "FLIGHTS_CACHE_TTL cannot be negative."
+        )
 
     required_values = {
         "DATABRICKS_HOST": server_hostname,
@@ -49,12 +80,10 @@ def _load_config():
 
     if missing_values:
         raise ValueError(
-            f"Missing Databricks configuration: "
-            f"{', '.join(missing_values)}"
+            "Missing Databricks configuration: "
+            + ", ".join(missing_values)
         )
 
-    # The table name is inserted into the SQL statement, so only permit
-    # valid one-part, two-part or three-part identifiers.
     if not re.fullmatch(
         r"[A-Za-z_][A-Za-z0-9_]*"
         r"(\.[A-Za-z_][A-Za-z0-9_]*){0,2}",
@@ -70,15 +99,18 @@ def _load_config():
         "client_id": client_id,
         "client_secret": client_secret,
         "table_name": table_name,
+        "cache_ttl": cache_ttl,
     }
 
 
+# ---------------------------------------------------------
+# DATABRICKS CONNECTION
+# ---------------------------------------------------------
+
 def _create_connection(config):
-    connect_start = time.monotonic()
+    start = time.monotonic()
 
     server_hostname = config["server_hostname"]
-    client_id = config["client_id"]
-    client_secret = config["client_secret"]
 
     app.logger.info(
         "[DBX] Opening connection to host=%s",
@@ -88,8 +120,8 @@ def _create_connection(config):
     def credential_provider():
         sdk_config = Config(
             host=f"https://{server_hostname}",
-            client_id=client_id,
-            client_secret=client_secret,
+            client_id=config["client_id"],
+            client_secret=config["client_secret"],
         )
 
         return oauth_service_principal(sdk_config)
@@ -101,8 +133,8 @@ def _create_connection(config):
     )
 
     app.logger.info(
-        "[DBX] Connection opened in %.2fs",
-        time.monotonic() - connect_start,
+        "[DBX] Connection opened in %.3fs",
+        time.monotonic() - start,
     )
 
     return connection
@@ -129,12 +161,16 @@ def _close_connection():
 
     except Exception:
         app.logger.exception(
-            "[DBX] Error while closing connection"
+            "[DBX] Error closing connection"
         )
 
     finally:
         _db_connection = None
 
+
+# ---------------------------------------------------------
+# QUERY
+# ---------------------------------------------------------
 
 def _execute_flights_query(connection, table_name):
     cursor = None
@@ -147,78 +183,70 @@ def _execute_flights_query(connection, table_name):
             FROM {table_name}
         """
 
-        execute_start = time.monotonic()
+        start = time.monotonic()
 
         app.logger.info(
-            "[DBX] Executing query against table=%s",
-            table_name,
+            "[DBX] Executing flight query"
         )
 
         cursor.execute(query)
 
         app.logger.info(
-            "[DBX] Query execution completed in %.2fs",
-            time.monotonic() - execute_start,
+            "[DBX] Query executed in %.3fs",
+            time.monotonic() - start,
         )
 
         fetch_start = time.monotonic()
 
         rows = cursor.fetchall()
+
         columns = [
             column[0]
             for column in cursor.description
         ]
 
-        app.logger.info(
-            "[DBX] Fetched %d rows in %.2fs",
-            len(rows),
-            time.monotonic() - fetch_start,
-        )
-
-        return [
+        flights = [
             dict(zip(columns, row))
             for row in rows
         ]
+
+        app.logger.info(
+            "[DBX] Fetched %d flights in %.3fs",
+            len(flights),
+            time.monotonic() - fetch_start,
+        )
+
+        return flights
 
     finally:
         if cursor is not None:
             try:
                 cursor.close()
-
             except Exception:
                 app.logger.exception(
-                    "[DBX] Error while closing cursor"
+                    "[DBX] Error closing cursor"
                 )
 
 
-def _query_flights():
-    request_start = time.monotonic()
-    config = _load_config()
+def _query_flights(config):
+    """
+    Execute against Databricks.
 
-    app.logger.info(
-        "[DBX] Configuration loaded: "
-        "host=%s table=%s",
-        config["server_hostname"],
-        config["table_name"],
-    )
+    If the existing session has gone stale, discard it,
+    reconnect and retry once.
+    """
 
-    # A single shared connection is protected from concurrent cursor use.
     with _db_lock:
+
         for attempt in range(1, 3):
+
             try:
                 connection = _get_connection(config)
 
-                flights = _execute_flights_query(
-                    connection=connection,
-                    table_name=config["table_name"],
+                return _execute_flights_query(
+                    connection,
+                    config["table_name"],
                 )
-
-                app.logger.info(
-                    "[DBX] Database operation completed in %.2fs",
-                    time.monotonic() - request_start,
-                )
-
-                return flights
 
             except Exception:
                 app.logger.exception(
@@ -226,21 +254,139 @@ def _query_flights():
                     attempt,
                 )
 
-                # Discard a potentially stale or broken session.
                 _close_connection()
 
                 if attempt == 2:
                     raise
 
                 app.logger.warning(
-                    "[DBX] Reconnecting and retrying once"
+                    "[DBX] Reconnecting and retrying"
                 )
 
-    # Defensive fallback; execution should never reach this point.
     raise RuntimeError(
         "Databricks query failed unexpectedly."
     )
 
+
+# ---------------------------------------------------------
+# CACHE
+# ---------------------------------------------------------
+
+def _get_flights(config):
+    now = time.monotonic()
+    ttl = config["cache_ttl"]
+
+    # First check without querying Databricks.
+    with _cache_lock:
+
+        cached_flights = _flight_cache["flights"]
+        cache_timestamp = _flight_cache["timestamp"]
+
+        cache_age = now - cache_timestamp
+
+        if (
+            cached_flights is not None
+            and cache_age < ttl
+        ):
+            app.logger.info(
+                "[CACHE] HIT age=%.2fs ttl=%ds",
+                cache_age,
+                ttl,
+            )
+
+            return cached_flights, True, cache_age
+
+    app.logger.info(
+        "[CACHE] MISS"
+    )
+
+    # Only one request should refresh the cache at a time.
+    with _db_lock:
+
+        # Check again after obtaining the DB lock.
+        # Another request may have refreshed the cache
+        # while this request was waiting.
+        now = time.monotonic()
+
+        with _cache_lock:
+
+            cached_flights = _flight_cache["flights"]
+            cache_timestamp = _flight_cache["timestamp"]
+
+            cache_age = now - cache_timestamp
+
+            if (
+                cached_flights is not None
+                and cache_age < ttl
+            ):
+                app.logger.info(
+                    "[CACHE] HIT after waiting "
+                    "age=%.2fs ttl=%ds",
+                    cache_age,
+                    ttl,
+                )
+
+                return (
+                    cached_flights,
+                    True,
+                    cache_age,
+                )
+
+        # -------------------------------------------------
+        # CACHE REALLY IS EXPIRED
+        # -------------------------------------------------
+
+        global _db_connection
+
+        for attempt in range(1, 3):
+
+            try:
+                connection = _get_connection(config)
+
+                flights = _execute_flights_query(
+                    connection,
+                    config["table_name"],
+                )
+
+                break
+
+            except Exception:
+                app.logger.exception(
+                    "[DBX] Query attempt %d failed",
+                    attempt,
+                )
+
+                _close_connection()
+
+                if attempt == 2:
+                    raise
+
+                app.logger.warning(
+                    "[DBX] Reconnecting and retrying"
+                )
+
+        # -------------------------------------------------
+        # UPDATE CACHE
+        # -------------------------------------------------
+
+        with _cache_lock:
+
+            _flight_cache["flights"] = flights
+            _flight_cache["timestamp"] = (
+                time.monotonic()
+            )
+
+        app.logger.info(
+            "[CACHE] Updated with %d flights",
+            len(flights),
+        )
+
+        return flights, False, 0.0
+
+
+# ---------------------------------------------------------
+# ROUTES
+# ---------------------------------------------------------
 
 @app.get("/")
 def health():
@@ -252,6 +398,7 @@ def health():
 
 @app.get("/getFlights")
 def get_flights():
+
     request_start = time.monotonic()
 
     app.logger.info(
@@ -259,9 +406,14 @@ def get_flights():
     )
 
     try:
-        flights = _query_flights()
+        config = _load_config()
+
+        flights, cached, cache_age = (
+            _get_flights(config)
+        )
 
     except Exception as exc:
+
         app.logger.exception(
             "[API] /getFlights failed: %s",
             type(exc).__name__,
@@ -275,19 +427,32 @@ def get_flights():
     elapsed = time.monotonic() - request_start
 
     app.logger.info(
-        "[API] Returning %d flights after %.2fs",
+        "[API] Returning %d flights "
+        "cached=%s after %.3fs",
         len(flights),
+        cached,
         elapsed,
     )
 
     return jsonify({
         "count": len(flights),
-        "query_seconds": round(elapsed, 3),
+
+        # Useful while developing.
+        # You can remove these later.
+        "cached": cached,
+        "cache_age_seconds": round(
+            cache_age,
+            2,
+        ),
+
         "flights": flights,
     }), 200
 
 
-# Close the connection cleanly if the worker process exits.
+# ---------------------------------------------------------
+# CLEANUP
+# ---------------------------------------------------------
+
 atexit.register(_close_connection)
 
 
